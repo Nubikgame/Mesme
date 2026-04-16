@@ -1,0 +1,16 @@
+# Базы данных
+*.db
+mesme_base.db
+
+# Виртуальное окружение Питона
+venv/
+.venv/
+
+# Медиафайлы юзеров
+backend/avatars/
+avatars/
+
+# Системный мусор и кэш
+__pycache__/
+*.pyc
+.DS_Store
