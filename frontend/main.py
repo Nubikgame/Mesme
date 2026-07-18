@@ -4,7 +4,10 @@ import time
 import json
 import websocket
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+SERVER_IP = "127.0.0.1"
 
 API_URL = "http://127.0.0.1:8000/auth"
 CHAT_API_URL = "http://127.0.0.1:8000/chat"
@@ -41,6 +44,10 @@ def main(page: ft.Page):
     
     current_open_chat = None
     ws_app = None
+    blue_accent = "#4A90E2" 
+    my_message_status_ctrls = {}  # msg_id -> ft.Text с галочками (пока сообщение не прочитано)
+    def get_chats_key():
+        return f"mesme_chats_{user_info['email']}"
 
     # 🔥 ФУНКЦИЯ ГЕНЕРАЦИИ ID ПРИВАТНОЙ КОМНАТЫ
     def get_private_room_id(u1, u2):
@@ -49,16 +56,43 @@ def main(page: ft.Page):
     # 🔥 ОБРАБОТЧИК СООБЩЕНИЙ С УЧЕТОМ ВРЕМЕНИ
     def on_ws_message(ws, message):
         data = json.loads(message)
-        sender = data.get("sender")
-        text = data.get("text")
-        timestamp = data.get("timestamp")
+        action = data.get("action", "new_message")
         
-        append_message_to_ui(sender, text, timestamp)
+        if action == "new_message":
+            append_message_to_ui(
+                sender=data.get("sender"), 
+                text=data.get("text"), 
+                timestamp=data.get("timestamp"), 
+                is_read=data.get("is_read", False),
+                is_delivered=data.get("is_delivered", False),
+                msg_id=data.get("id")
+            )
+            # 🔥 Если сообщение прислал не я, а чат у меня в этот момент открыт -
+            # значит я его вижу вживую, сразу шлём mark_read. Раньше mark_read
+            # уходил только один раз при заходе в чат, и статус "прочитано" переставал
+            # обновляться для сообщений, пришедших уже во время открытой переписки
+            if data.get("sender") != user_info.get("nickname"):
+                try:
+                    ws.send(json.dumps({"action": "mark_read", "sender": user_info.get("nickname")}))
+                except:
+                    pass
+        elif action == "messages_read":
+            reader = data.get("reader")
+            # Если прочитал не я, значит прочитали МОИ сообщения. Красим галочки в синий!
+            if reader != user_info.get("nickname"):
+                for status_ctrl in my_message_status_ctrls.values():
+                    status_ctrl.value = "✓✓"
+                    status_ctrl.color = blue_accent
+                page.update()
+                my_message_status_ctrls.clear()
 
-    # 🔥 ДОБАВЛЕНО ОТОБРАЖЕНИЕ ВРЕМЕНИ В ПУЗЫРЯХ
-    def append_message_to_ui(sender, text, timestamp=None):
+    def append_message_to_ui(sender, text, timestamp=None, is_read=False, is_delivered=False, msg_id=None, update=True):
         if timestamp:
-            time_str = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%H:%M")
+            utc_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if utc_dt.tzinfo is None:
+                utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+            local_dt = utc_dt.astimezone()
+            time_str = local_dt.strftime("%H:%M")
         else:
             time_str = datetime.now().strftime("%H:%M")
 
@@ -69,28 +103,49 @@ def main(page: ft.Page):
         alignment = ft.MainAxisAlignment.END if is_me else ft.MainAxisAlignment.START
         bubble_width = None if len(text) < 30 else 250
 
-        message_bubble = ft.Row(
-            [
-                ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text(sender, size=10, color=peach if is_me else "grey", weight="bold"),
-                            ft.Text(text, color=text_color, selectable=True),
-                            ft.Text(time_str, size=9, color="grey", text_align=ft.TextAlign.RIGHT)
-                        ], 
-                        spacing=2
-                    ),
-                    bgcolor=bubble_color, 
-                    padding=10, 
-                    border_radius=10, 
-                    width=bubble_width
-                )
-            ], 
-            alignment=alignment
-        )
+        is_private_chat = current_open_chat and current_open_chat.startswith("p2p_")
+        
+        bubble_content = []
+        if not is_private_chat:
+            bubble_content.append(ft.Text(sender, size=10, color=peach if is_me else "grey", weight="bold"))
+        
+        bubble_content.append(ft.Text(text, color=text_color, selectable=True))
 
+        # 🔥 ЛОГИКА ОТРИСОВКИ ГАЛОЧЕК - как в Telegram:
+        # ✓ серая = отправлено, ✓✓ серые = доставлено, ✓✓ синие = прочитано
+        status_ctrl = ft.Text("", size=10)
+        if is_me:
+            if is_read:
+                status_ctrl.value = "✓✓"
+                status_ctrl.color = blue_accent
+            elif is_delivered:
+                status_ctrl.value = "✓✓"
+                status_ctrl.color = "grey"
+            else:
+                status_ctrl.value = "✓"
+                status_ctrl.color = "grey"
+
+            # Пока сообщение не прочитано - запоминаем контрол по id, чтобы потом
+            # обновить его на месте (доставлено -> прочитано), не перерисовывая весь чат
+            if not is_read and msg_id is not None:
+                my_message_status_ctrls[msg_id] = status_ctrl
+
+        bottom_row = ft.Row(
+            [ft.Text(time_str, size=9, color="grey"), status_ctrl], 
+            alignment=ft.MainAxisAlignment.END, spacing=3
+        )
+        bubble_content.append(bottom_row)
+
+        message_bubble = ft.Row([
+            ft.Container(
+                content=ft.Column(bubble_content, spacing=2),
+                bgcolor=bubble_color, padding=10, border_radius=10, width=bubble_width
+            )
+        ], alignment=alignment)
+        
         chat_messages_list.controls.append(message_bubble)
-        page.update()
+        if update:
+            page.update()
     def show_create_group_screen(e):
         page.clean()
         page.bgcolor = white
@@ -159,10 +214,10 @@ def main(page: ft.Page):
                     group_id = data["group_id"]
 
                     # Сохраняем группу в сохранённые чаты
-                    saved_chats = page.client_storage.get("mesme_chats") or []
+                    saved_chats = page.client_storage.get(get_chats_key()) or []
                     if not any(c["chat_id"] == group_id for c in saved_chats):
                         saved_chats.append({"title": name, "chat_id": group_id})
-                        page.client_storage.set("mesme_chats", saved_chats)
+                        page.client_storage.set(get_chats_key(), saved_chats)
 
                     # Переходим сразу в созданную группу
                     show_chat_screen(name, group_id)
@@ -249,12 +304,18 @@ def main(page: ft.Page):
                         return
 
                     room_id = get_private_room_id(my_un, target["username"])
-                    chat_title = "Избранное (Я)" if target["username"] == my_un else target["nickname"]
+                    
+                    # 🔥 Проверяем, ищем ли мы сами себя
+                    if target["username"] == my_un:
+                        chat_title = "Избранное (Я)"
+                    else:
+                        chat_title = target["nickname"]
 
-                    saved_chats = page.client_storage.get("mesme_chats") or []
+                    # 🔥 ИСПОЛЬЗУЕМ ЛИЧНУЮ ПАМЯТЬ АККАУНТА
+                    saved_chats = page.client_storage.get(get_chats_key()) or []
                     if not any(c["chat_id"] == room_id for c in saved_chats):
                         saved_chats.append({"title": chat_title, "chat_id": room_id})
-                        page.client_storage.set("mesme_chats", saved_chats)
+                        page.client_storage.set(get_chats_key(), saved_chats)
 
                     show_chat_screen(chat_title, room_id)
                 else:
@@ -274,7 +335,7 @@ def main(page: ft.Page):
             content_padding=15,
             border_color="transparent",
             bgcolor="#F5F5F5",
-            on_submit=do_search
+            on_change=do_search
         )
 
         options_list = ft.ListView(
@@ -318,57 +379,110 @@ def main(page: ft.Page):
         page.update()
 
     # 🔥 ЛОГИКА ПОИСКА ПОЛЬЗОВАТЕЛЕЙ
-    def start_search(e):
-        search_field = ft.TextField(label="Введите @username", autofocus=True)
-        
-        def confirm_search(e):
-            username = search_field.value.replace("@", "").strip()
-            if not username: return
+    def show_search_screen(e=None):
+        page.clean()
+        page.bgcolor = white
+        if page.navigation_bar: page.navigation_bar.visible = False
+        if page.floating_action_button: page.floating_action_button.visible = False
+
+        search_results_list = ft.ListView(expand=True, spacing=10, padding=10)
+
+
+        def go_back(e):
+            show_main_screen()
+
+        # Функция для сохранения и перехода в чат
+        def save_and_open_chat(chat_title, room_id):
+            saved_chats = page.client_storage.get(get_chats_key()) or []
+            if not any(c["chat_id"] == room_id for c in saved_chats):
+                saved_chats.append({"title": chat_title, "chat_id": room_id})
+                page.client_storage.set(get_chats_key(), saved_chats)
+            show_chat_screen(chat_title, room_id)
+
+        # Главная функция поиска
+        def perform_search(e):
+            query = search_input.value.strip()
+            search_results_list.controls.clear()
+            
+            if len(query) < 2:
+                page.update()
+                return
+
+            # 1. ЛОКАЛЬНЫЙ ПОИСК (по твоим открытым чатам)
+            saved_chats = page.client_storage.get(get_chats_key()) or []
+            local_results = [c for c in saved_chats if query.lower() in c["title"].lower()]
+            
+            if local_results:
+                search_results_list.controls.append(ft.Text("Мои чаты", color=teal, weight="bold"))
+                for c in local_results:
+                    search_results_list.controls.append(
+                        ft.ListTile(
+                            leading=ft.CircleAvatar(content=ft.Text(c["title"][0].upper(), color=white), bgcolor="#8E8E93"),
+                            title=ft.Text(c["title"], color="black", weight="bold"),
+                            on_click=lambda e, t=c["title"], cid=c["chat_id"]: show_chat_screen(t, cid)
+                        )
+                    )
+
+            # 2. ГЛОБАЛЬНЫЙ ПОИСК (по всей базе)
+            search_results_list.controls.append(ft.Text("Глобальный поиск", color=teal, weight="bold"))
             
             try:
-                res = requests.get(f"{API_URL}/find-user/{username}")
-                if res.status_code == 200:
-                    target = res.json()
-                    page.dialog.open = False
-                    
-                    my_un = user_info.get("username")
+                # Обращаемся к нашей новой умной функции в бэкенде
+                res = requests.get(f"{API_URL}/search-users/{query}", timeout=5)
+                found_users = res.json() if res.status_code == 200 else []
+                my_un = user_info.get("username")
+
+                if not found_users:
+                    search_results_list.controls.append(ft.Text("Никто не найден", color="grey"))
+                else:
+                    # 🔥 ВОТ ЭТА ЗАЩИТА СПАСЕТ ПРИЛОЖЕНИЕ ОТ КРАША!
                     if not my_un:
-                        page.snack_bar = ft.SnackBar(ft.Text("Сначала задайте @username в профиле!"))
-                        page.snack_bar.open = True
+                        search_results_list.controls.append(ft.Text("⚠️ Сначала задайте @username в Профиле!", color="red"))
                         page.update()
                         return
-                    
-                    room_id = get_private_room_id(my_un, target["username"])
-                    
-                    # 🔥 ПРОКАЧКА: Если ищем сами себя - делаем "Избранное"
-                    if target["username"] == my_un:
-                        chat_title = "Избранное (Я)"
-                    else:
-                        chat_title = target["nickname"]
 
-                    # 🔥 ПРОКАЧКА: Запоминаем чат, чтобы он появился на главном экране!
-                    saved_chats = page.client_storage.get("mesme_chats") or []
-                    # Проверяем, нет ли уже такого чата в списке
-                    if not any(c["chat_id"] == room_id for c in saved_chats):
-                        saved_chats.append({"title": chat_title, "chat_id": room_id})
-                        page.client_storage.set("mesme_chats", saved_chats)
-                    
-                    show_chat_screen(chat_title, room_id)
-                else:
-                    search_field.error_text = "Пользователь не найден"
-                    page.update()
+                    for target in found_users:
+                        # Пропускаем тех, у кого нет username
+                        if not target.get("username"): continue 
+
+                        room_id = get_private_room_id(my_un, target["username"])
+                        chat_title = "Избранное (Я)" if target["username"] == my_un else target["nickname"]
+                        
+                        search_results_list.controls.append(
+                            ft.ListTile(
+                                leading=ft.CircleAvatar(content=ft.Text(chat_title[0].upper(), color=white), bgcolor="#4A90E2"),
+                                title=ft.Text(chat_title, color="black", weight="bold"),
+                                subtitle=ft.Text(f"@{target['username']}", color="grey"),
+                                on_click=lambda e, t=chat_title, cid=room_id: save_and_open_chat(t, cid)
+                            )
+                        )
             except Exception as ex:
-                print("Ошибка поиска:", ex)
+                print("Ошибка глобального поиска:", ex)
+                search_results_list.controls.append(ft.Text("Ошибка соединения с сервером", color="red"))
+            
+            page.update()
 
-        page.dialog = ft.AlertDialog(
-            title=ft.Text("Поиск собеседника"),
-            content=search_field,
-            actions=[
-                ft.TextButton("Отмена", on_click=lambda _: setattr(page.dialog, "open", False) or page.update()),
-                ft.ElevatedButton("Найти", on_click=confirm_search, bgcolor=teal, color=white)
-            ]
+        # Поле ввода, которое выглядит как встроенное в шапку
+        search_input = ft.TextField(
+            hint_text="Поиск...", 
+            border_radius=30,
+            content_padding=10,
+            border_color="transparent",
+            bgcolor="#F5F5F5",
+            expand=True,
+            autofocus=True,
+            on_change=perform_search, # Поиск запускается по нажатию Enter на клавиатуре
         )
-        page.dialog.open = True
+
+        page.appbar = ft.AppBar(
+            leading=ft.IconButton(ft.icons.ARROW_BACK, icon_color=teal, on_click=go_back),
+            title=search_input,
+            bgcolor=white,
+            elevation=0
+        )
+        page.appbar.visible = True
+
+        page.add(search_results_list)
         page.update()
 
     # --- ИНСТРУМЕНТ ВЫБОРА ФОТО ---
@@ -385,6 +499,7 @@ def main(page: ft.Page):
     # --- ЭЛЕМЕНТЫ ВВОДА ---
     email_field = ft.TextField(
         label="Ваша почта", 
+        keyboard_type=ft.KeyboardType.EMAIL,
         width=300, 
         border_color=peach, 
         cursor_color=peach, 
@@ -458,13 +573,20 @@ def main(page: ft.Page):
         page.update()
 
         try:
-            response = requests.post(f"{API_URL}/request-code", json={"email": email}, timeout=3)
+            # Таймаут увеличен: письмо реально уходит через SMTP, это не мгновенно
+            response = requests.post(f"{API_URL}/request-code", json={"email": email}, timeout=10)
             if response.status_code == 200:
                 login_card.content = otp_view
             else:
-                email_field.error_text = "Ошибка сервера (Проверь пароль от почты!)"
+                try:
+                    detail = response.json().get("detail", "Ошибка сервера")
+                except Exception:
+                    detail = "Ошибка сервера"
+                email_field.error_text = detail
         except requests.exceptions.ConnectionError:
             email_field.error_text = "Сервер недоступен!"
+        except requests.exceptions.Timeout:
+            email_field.error_text = "Сервер долго отвечает, попробуйте ещё раз"
 
         btn_request.disabled = False
         btn_request.text = "Получить код"
@@ -585,9 +707,10 @@ def main(page: ft.Page):
         page.update()
 
     # 🔥 ИЗМЕНЕНО: теперь принимает chat_id
-    def show_chat_screen(chat_title, chat_id="global"):
+    def show_chat_screen(chat_title, chat_id):
         nonlocal current_open_chat
         current_open_chat = chat_id
+        my_message_status_ctrls.clear()
         
         page.clean()
         page.bgcolor = white
@@ -617,41 +740,6 @@ def main(page: ft.Page):
         page.appbar.visible = True
         
         chat_messages_list.controls.clear()
-        
-        if chat_title == "Mesme Bot":
-            chat_messages_list.controls.append(
-                ft.Row(
-                    [
-                        ft.Container(
-                            content=ft.Text("Привет! Я официальный бот Mesme.", color="black"), 
-                            bgcolor=peach, 
-                            padding=10, 
-                            border_radius=10
-                        )
-                    ], 
-                    alignment=ft.MainAxisAlignment.START
-                )
-            )
-        else:
-            # ЗАГРУЖАЕМ ИСТОРИЮ ИЗ БД ПО CHAT_ID
-            try:
-                hist_res = requests.get(f"{CHAT_API_URL}/history/{chat_id}")
-                if hist_res.status_code == 200:
-                    for msg in hist_res.json():
-                        append_message_to_ui(msg["sender"], msg["text"], msg.get("timestamp"))
-            except Exception as e:
-                print("Ошибка истории:", e)
-
-            # ПОДКЛЮЧАЕМ РЕАЛТАЙМ
-            def connect_ws():
-                nonlocal ws_app
-                ws_url = f"ws://127.0.0.1:8000/chat/ws/{chat_id}"
-                ws_app = websocket.WebSocketApp(ws_url, on_message=on_ws_message)
-                ws_app.run_forever()
-            
-            wst = threading.Thread(target=connect_ws)
-            wst.daemon = True
-            wst.start()
 
         message_input = ft.TextField(
             hint_text="Сообщение...", 
@@ -669,19 +757,13 @@ def main(page: ft.Page):
             message_input.value = ""
             page.update()
 
-            if chat_title == "Mesme Bot":
-                append_message_to_ui(user_info.get("nickname", "Я"), val)
-                time.sleep(0.5)
-                append_message_to_ui("Mesme Bot", "Сообщение получено. Я пока не настроен на умные ответы!")
-
-            else:
-                msg_data = {"sender": user_info.get("nickname", "Аноним"), "text": val}
-                nonlocal ws_app
-                if ws_app:
-                    try: 
-                        ws_app.send(json.dumps(msg_data))
-                    except: 
-                        print("Ошибка отправки в сокет")
+            msg_data = {"sender": user_info.get("nickname", "Аноним"), "text": val}
+            nonlocal ws_app
+            if ws_app:
+                try: 
+                    ws_app.send(json.dumps(msg_data))
+                except: 
+                    print("Ошибка отправки в сокет")
 
         input_row = ft.Container(
             padding=10, 
@@ -695,50 +777,91 @@ def main(page: ft.Page):
             )
         )
 
+        # 🔥 Сначала показываем сам экран чата (пустым) и только потом лезем в сеть -
+        # раньше история грузилась ДО этого page.update(), причём вообще без
+        # таймаута, поэтому при недоступном сервере экран мог зависнуть насовсем
         page.add(chat_messages_list, input_row)
         page.update()
+
+        # ЗАГРУЖАЕМ ИСТОРИЮ ИЗ БД ПО CHAT_ID - в фоновом потоке, с таймаутом
+        def load_history():
+            try:
+                hist_res = requests.get(f"{CHAT_API_URL}/history/{chat_id}", timeout=8)
+                if hist_res.status_code == 200:
+                    for msg in hist_res.json():
+                        append_message_to_ui(
+                            msg["sender"], msg["text"], msg.get("timestamp"), 
+                            is_read=msg.get("is_read", False), 
+                            is_delivered=msg.get("is_delivered", False), 
+                            msg_id=msg.get("id"), 
+                            update=False
+                        )
+                    page.update()
+            except Exception as e:
+                print("Ошибка истории:", e)
+
+        threading.Thread(target=load_history, daemon=True).start()
+
+        # ПОДКЛЮЧАЕМ РЕАЛТАЙМ
+        def connect_ws():
+            nonlocal ws_app
+            ws_url = f"ws://127.0.0.1:8000/chat/ws/{chat_id}"
+
+            def on_open(ws):
+                ws.send(json.dumps({"action": "mark_read", "sender": user_info.get("nickname")}))
+                
+            ws_app = websocket.WebSocketApp(ws_url, on_message=on_ws_message, on_open=on_open)
+            ws_app.run_forever()
+        
+        wst = threading.Thread(target=connect_ws)
+        wst.daemon = True
+        wst.start()
 
     def show_main_screen():
         page.clean()
         page.bgcolor = white
         page.vertical_alignment = ft.MainAxisAlignment.START
         page.horizontal_alignment = ft.CrossAxisAlignment.START
-        page.floating_action_button = ft.FloatingActionButton(
-            icon=ft.icons.ADD,
-            bgcolor=peach,
-            on_click=show_new_message_screen
-        )
+        page.floating_action_button = ft.FloatingActionButton(icon=ft.icons.ADD, bgcolor=peach, on_click=show_new_message_screen)
+        my_username = user_info.get('username')
 
-        # Базовые чаты, которые есть всегда
-        chat_tiles = [
-            ft.ListTile(
-                leading=ft.CircleAvatar(content=ft.Text("G", color=white), bgcolor=peach),
-                title=ft.Text("Глобальный Чат", weight="bold", color="black"),
-                subtitle=ft.Text("Общий чат для всех онлайн", color="black54"),
-                on_click=lambda _: show_chat_screen("Глобальный Чат", "global")
-            ),
-            ft.ListTile(
-                leading=ft.CircleAvatar(content=ft.Text("M", color=white), bgcolor=teal),
-                title=ft.Text("Mesme Bot", weight="bold", color="black"),
-                subtitle=ft.Text("Добро пожаловать в Message Me!", color="black54"),
-                on_click=lambda _: show_chat_screen("Mesme Bot", "bot")
-            )
-        ]
+        # Личные чаты и группы пользователя (глобальный чат и бот убраны -
+        # они были нужны не всем, и по факту просто занимали место)
+        chat_tiles = []
 
-        # 🔥 ПРОКАЧКА: Загружаем все личные диалоги на главный экран
-        saved_chats = page.client_storage.get("mesme_chats") or []
+        # 🔥 ПРОКАЧКА: Загружаем все личные диалоги на главный экран (сразу, из локального кэша, без сети)
+        saved_chats = page.client_storage.get(get_chats_key()) or []
+        chat_id_to_tile = {}  # запомним тайлы, чтобы потом дорисовать бейджи непрочитанных
         for c in saved_chats:
             is_saved_msgs = (c["title"] == "Избранное (Я)")
-            # Для "Избранного" делаем иконку звездочки, для остальных - первую букву имени
             avatar_content = "🌟" if is_saved_msgs else c["title"][0].upper()
-            avatar_bg = "#4A90E2" if is_saved_msgs else "#8E8E93"
+            avatar_bg = blue_accent if is_saved_msgs else "#8E8E93"
 
+            tile = ft.ListTile(
+                leading=ft.CircleAvatar(content=ft.Text(avatar_content, color=white, size=18 if is_saved_msgs else 20), bgcolor=avatar_bg),
+                title=ft.Text(c["title"], weight="bold", color="black"),
+                trailing=None,
+                on_click=lambda e, title=c["title"], cid=c["chat_id"]: show_chat_screen(title, cid)
+            )
+            chat_tiles.append(tile)
+            chat_id_to_tile[c["chat_id"]] = tile
+
+        # 🔥 Если чатов пока нет вообще - показываем подсказку, а не пустой экран
+        if not chat_tiles:
             chat_tiles.append(
-                ft.ListTile(
-                    leading=ft.CircleAvatar(content=ft.Text(avatar_content, color=white, size=18 if is_saved_msgs else 20), bgcolor=avatar_bg),
-                    title=ft.Text(c["title"], weight="bold", color="black"),
-                    # Используем lambda с сохранением контекста для правильного открытия нужного чата
-                    on_click=lambda e, title=c["title"], cid=c["chat_id"]: show_chat_screen(title, cid)
+                ft.Container(
+                    padding=ft.padding.only(top=80, left=40, right=40),
+                    alignment=ft.alignment.center,
+                    content=ft.Column(
+                        [
+                            ft.Icon(ft.icons.CHAT_BUBBLE_OUTLINE, size=48, color="#BDBDBD"),
+                            ft.Container(height=10),
+                            ft.Text("Пока нет ни одного чата", color="grey", size=16, weight="bold"),
+                            ft.Text("Нажмите + внизу, чтобы найти собеседника", color="grey", size=13),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=2
+                    )
                 )
             )
 
@@ -837,7 +960,7 @@ def main(page: ft.Page):
             selected = e.control.selected_index
             if selected == 0:
                 page.appbar.title.value = "Mesme"
-                page.appbar.actions = [ft.IconButton(ft.icons.SEARCH, icon_color=teal, on_click=start_search)]
+                page.appbar.actions = [ft.IconButton(ft.icons.SEARCH, icon_color=teal, on_click=lambda _: show_search_screen())]
                 page.floating_action_button.visible = True # 🔥 Показываем плюсик
                 container.content = chats_content
             elif selected == 1:
@@ -856,7 +979,7 @@ def main(page: ft.Page):
             title=ft.Text("Mesme", color=teal, weight="bold"), 
             bgcolor=white, 
             # 🔥 Добавлена кнопка поиска
-            actions=[ft.IconButton(ft.icons.SEARCH, icon_color=teal, on_click=start_search)]
+            actions=[ft.IconButton(ft.icons.SEARCH, icon_color=teal, on_click=lambda _: show_search_screen())]
         )
         page.appbar.visible = True
         
@@ -886,6 +1009,33 @@ def main(page: ft.Page):
         
         page.add(container)
         page.update()
+
+        # 🔥 Бейджи непрочитанных подгружаем ПОСЛЕ отрисовки, отдельным фоновым
+        # потоком - раньше этот запрос стоял в самом начале функции и держал
+        # экран пустым (после page.clean()) все те 1-3 секунды, что сервер отвечал
+        def load_unread_counts():
+            if not my_username:
+                return
+            try:
+                res = requests.get(f"{CHAT_API_URL}/unread-counts/{my_username}", timeout=8)
+                if res.status_code != 200:
+                    return
+                counts = res.json()
+            except Exception:
+                return
+
+            for cid, tile in chat_id_to_tile.items():
+                count = counts.get(cid, 0)
+                if count > 0:
+                    tile.trailing = ft.Container(
+                        content=ft.Text(str(count), color=white, size=12, weight="bold"),
+                        bgcolor=blue_accent, padding=ft.padding.only(left=8, right=8, top=4, bottom=4), border_radius=15
+                    )
+                else:
+                    tile.trailing = None
+            page.update()
+
+        threading.Thread(target=load_unread_counts, daemon=True).start()
 
     # --- Инициализация кнопок ---
     btn_request = ft.ElevatedButton(

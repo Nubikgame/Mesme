@@ -21,6 +21,8 @@ class Message(Base):
     sender = Column(String)                
     text = Column(String)                  
     timestamp = Column(DateTime, default=datetime.utcnow)
+    is_read = Column(Boolean, default=False)
+    is_delivered = Column(Boolean, default=False)  # 🔥 Статус доставки (для галочек как в Telegram)
 
 
 class ChatGroup(Base):
